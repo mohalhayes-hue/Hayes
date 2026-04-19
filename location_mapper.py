@@ -1,6 +1,3 @@
-# (Full script as before, but with the abbreviation matching improvements)
-# I'll include the entire script for completeness – but to keep the response manageable, I'll highlight the new parts and provide the full code.
-
 import re
 import math
 import json
@@ -16,6 +13,7 @@ from functools import lru_cache
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from openpyxl.styles import PatternFill
 
 try:
     from rapidfuzz import fuzz, process
@@ -167,7 +165,7 @@ DEFAULT_CONFIG = {
         "hana": "hana microelectronics",
         "tower": "tower semiconductor"
     },
-    "abbreviation_match_threshold": 85   # NEW: minimum similarity score (0-100) for fuzzy abbreviation match
+    "abbreviation_match_threshold": 85
 }
 
 # Load config from file if present
@@ -191,7 +189,7 @@ ACRONYM_ALIASES = DEFAULT_CONFIG["acronym_aliases"]
 ABBREVIATION_MATCH_THRESHOLD = DEFAULT_CONFIG["abbreviation_match_threshold"]
 
 # ------------------------------
-# Constants (remain as before)
+# Constants
 # ------------------------------
 COLUMN_ALIASES = {
     'location_id': ['location_id', 'location id', 'loc_id', 'locationid', 'companylocationid', 'company location id'],
@@ -237,7 +235,7 @@ FACILITY_VARIANTS = {
 NON_SITE_ORDINAL_CODES = {'1st', '2nd', '3rd', '4th', '5th', '6th'}
 
 # ------------------------------
-# Helper functions (unchanged)
+# Helper functions
 # ------------------------------
 def clean_header(s: str) -> str:
     s = str(s).strip().lower()
@@ -487,7 +485,7 @@ def build_master_search_blob(row: pd.Series, cols: Dict[str, str]) -> str:
     return ' | '.join([p for p in parts if p])
 
 # ------------------------------
-# parse_feature_value (unchanged)
+# Feature parsing with space splitting and multiple address detection
 # ------------------------------
 def _is_address_like(part: str) -> bool:
     norm_part = normalize_text(part)
@@ -542,16 +540,29 @@ def parse_feature_value(feature_value: str) -> Dict[str, object]:
     raw = safe_str(feature_value)
     raw = re.sub(r'(?<=[A-Za-z])(?=\d{1,4}(?:\b|[, -]))', ' ', raw)
     norm = normalize_text(raw)
-    parts = [p.strip() for p in re.split(r'[|\n]+', raw) if safe_str(p)]
+    
+    # Step 1: split on |, \n, ; and commas (keep original delimiters)
+    parts = [p.strip() for p in re.split(r'[|\n;,]+', raw) if safe_str(p)]
+    
+    # Step 2: expand each part by splitting on spaces, but only if not address-like
     expanded_parts = []
     for part in parts:
-        subparts = [s.strip() for s in re.split(r';+', part) if safe_str(s)]
-        if len(subparts) > 1:
-            expanded_parts.extend(subparts)
-        else:
+        if _is_address_like(part):
             expanded_parts.append(part)
+        else:
+            subparts = [sub.strip() for sub in part.split() if sub.strip()]
+            if len(subparts) > 1:
+                expanded_parts.extend(subparts)
+            else:
+                expanded_parts.append(part)
+    
     parts = expanded_parts
 
+    # Identify all address-like parts (for multiple addresses)
+    all_address_parts = [p for p in parts if _is_address_like(p)]
+    # Identify company hints (non-address, length between 2 and 8 words, not too short)
+    potential_companies = [p for p in parts if not _is_address_like(p) and 2 <= len(p.split()) <= 8 and len(p) >= 4]
+    
     facility_hints = []
     address_hints = []
     entity_hints = []
@@ -571,6 +582,10 @@ def parse_feature_value(feature_value: str) -> Dict[str, object]:
             address_hints.append(part)
 
     all_entity_parts = parts + [p for p in derived_parts if normalize_text(p) not in {normalize_text(x) for x in parts}]
+    
+    # If multiple address parts exist, treat each separately later in mapping
+    multiple_addresses = all_address_parts if len(all_address_parts) > 1 else []
+    
     if address_hints:
         address = max(address_hints, key=_address_richness)
     else:
@@ -621,6 +636,8 @@ def parse_feature_value(feature_value: str) -> Dict[str, object]:
         'address_hint': address,
         'company_hints': company_hints,
         'country_hint': country,
+        'multiple_addresses': multiple_addresses,
+        'potential_companies': potential_companies
     }
 
 def normalize_country(value: str) -> str:
@@ -633,9 +650,9 @@ def normalize_country(value: str) -> str:
     return norm
 
 # ------------------------------
-# Matching logic (master-based) - unchanged
+# Enhanced matching: company-first, multiple address support, facility mismatch comment
 # ------------------------------
-def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, str]) -> Dict:
+def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, str], input_facility_type: str = '') -> Dict:
     company = safe_str(cand.get(cols['company_name'])) if cols.get('company_name') else ''
     group_ = safe_str(cand.get(cols['group_name'])) if cols.get('group_name') else ''
     facility = safe_str(cand.get(cols['facility_name'])) if cols.get('facility_name') else ''
@@ -652,7 +669,12 @@ def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, 
     facility_type_input = input_ctx.get('facility_type', '')
     parsed_feature = parse_feature_value(feature_value)
 
+    # Company-first logic: if we have a company hint, boost company similarity
+    has_company_hint = len(parsed_feature['company_hints']) > 0 or len(parsed_feature['potential_companies']) > 0
+
     explicit_company_inputs = [v for v in parsed_feature['company_hints'] if safe_str(v)]
+    if not explicit_company_inputs and parsed_feature['potential_companies']:
+        explicit_company_inputs = parsed_feature['potential_companies'][:3]
     supporting_company_inputs = [v for v in [manufacturer, supplier] if safe_str(v)]
     entity_hint = parsed_feature.get('entity_hint', '')
     entity_company_score = max(
@@ -674,6 +696,10 @@ def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, 
     else:
         company_score = supporting_company_score
 
+    # If company hint exists, require a minimum company score for high confidence
+    if has_company_hint and company_score < 0.5:
+        company_score *= 0.7  # penalise weak company match
+
     explicit_group_score = max([company_similarity(v, group_) for v in explicit_company_inputs] + [0.0])
     supplier_group_score = max([company_similarity(v, group_) for v in [supplier] if safe_str(v)] + [0.0])
     group_score = max(explicit_group_score, supplier_group_score * (0.35 if explicit_company_inputs else 0.65))
@@ -691,7 +717,7 @@ def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, 
             if exact_or_contains(token, site_blob) >= 0.92:
                 facility_score = max(facility_score, 0.95)
 
-    address_inputs = [parsed_feature['address_hint'], feature_value]
+    address_inputs = [parsed_feature['address_hint']] + parsed_feature['multiple_addresses'] + [feature_value]
     address_inputs = [v for v in address_inputs if safe_str(v)]
     full_geo = ' '.join([address, city, state, country]).strip()
     address_score = max([address_similarity(v, full_geo) for v in address_inputs] + [0.0])
@@ -741,7 +767,7 @@ def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, 
 
     if facility_type_input and fac_type and facility_type_score < 0.35:
         penalties += PENALTIES["facility_type_conflict"]
-        reasons.append('facility type conflict')
+        reasons.append(f'facility type conflict (input: {facility_type_input}, master: {fac_type})')
 
     if (manufacturer or supplier) and not company_present and not address_present:
         penalties += PENALTIES["company_mismatch_weak_address"]
@@ -786,11 +812,18 @@ def score_candidate(input_ctx: Dict[str, str], cand: pd.Series, cols: Dict[str, 
         reasons.append('site code and address aligned')
 
     final_score = max(0.0, min(100.0, score - penalties))
+    
+    # Facility mismatch comment
+    facility_comment = ''
+    if facility_type_input and fac_type and facility_type_score < 0.6:
+        facility_comment = f'The facility not Matched (Master facility: {fac_type})'
+    
     return {
         'score': round(final_score, 2),
         'raw_score': round(score, 2),
         'penalties': round(penalties, 2),
         'reasons': reasons,
+        'facility_comment': facility_comment,
         'breakdown': {
             'company_name': round(company_score * MASTER_WEIGHTS['company_name'], 2),
             'group_name': round(group_score * MASTER_WEIGHTS['group_name'], 2),
@@ -816,7 +849,8 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
     if not feature_value:
         return {
             'matched_ids': '', 'score': 0.0, 'confidence': 'No Match', 'needs_review': 'Yes',
-            'selected_rows': [], 'match_basis': 'Blank FeatureValue', 'alternatives': ''
+            'selected_rows': [], 'match_basis': 'Blank FeatureValue', 'alternatives': '',
+            'facility_comment': ''
         }
 
     parsed_feature = parse_feature_value(feature_value)
@@ -848,6 +882,9 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
     entity_hint = parsed_feature.get('entity_hint', '')
     input_codes = extract_code_tokens(' '.join(parsed_feature['parts'][:3] + [feature_value]))
 
+    # Company-first shortlisting: if we have company hints, boost company-related tokens
+    has_company = len(parsed_feature['company_hints']) > 0 or len(parsed_feature['potential_companies']) > 0
+
     def shortlist_score(row):
         blob_tokens = row['_search_blob_tokens']
         facility_name = safe_str(row.get(master_cols.get('facility_name', ''), ''))
@@ -855,12 +892,16 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
         group_name = safe_str(row.get(master_cols.get('group_name', ''), ''))
         address = safe_str(row.get(master_cols.get('full_address', ''), ''))
         score = 0.0
+        # Always include token overlaps
         score += len(feature_tokens & blob_tokens) * SHORTLIST_W["feature_token"]
         score += len(address_tokens & blob_tokens) * SHORTLIST_W["address_token"]
         score += len(facility_tokens & informative_tokens(facility_name)) * SHORTLIST_W["facility_token"]
         score += len(manufacturer_tokens & (informative_tokens(company_name) | informative_tokens(group_name))) * SHORTLIST_W["manufacturer_token"]
         score += len(supplier_tokens & informative_tokens(group_name)) * SHORTLIST_W["supplier_token"]
-        score += len(company_hint_tokens & (informative_tokens(company_name) | informative_tokens(group_name) | informative_tokens(facility_name))) * SHORTLIST_W["company_hint_token"]
+        # Company hint tokens get higher weight if company is present
+        company_weight = SHORTLIST_W["company_hint_token"] * (1.5 if has_company else 1.0)
+        score += len(company_hint_tokens & (informative_tokens(company_name) | informative_tokens(group_name) | informative_tokens(facility_name))) * company_weight
+        
         if entity_hint and max(company_similarity(entity_hint, company_name), company_similarity(entity_hint, group_name), similarity(entity_hint, facility_name)) >= 0.85:
             score += SHORTLIST_W["entity_match_bonus"]
         if manufacturer and max(company_similarity(manufacturer, company_name), company_similarity(manufacturer, group_name)) >= 0.8 and not entity_hint:
@@ -882,7 +923,7 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
 
     scored = []
     for _, cand in short.iterrows():
-        sc = score_candidate(input_ctx, cand, master_cols)
+        sc = score_candidate(input_ctx, cand, master_cols, facility_type_input)
         if sc['score'] >= SCORE_THRESHOLDS["shortlist_min_score"]:
             scored.append({'candidate': cand, **sc})
 
@@ -890,44 +931,78 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
     if not scored:
         return {
             'matched_ids': '', 'score': 0.0, 'confidence': 'No Match', 'needs_review': 'Yes',
-            'selected_rows': [], 'match_basis': 'No candidates found', 'alternatives': ''
+            'selected_rows': [], 'match_basis': 'No candidates found', 'alternatives': '',
+            'facility_comment': ''
         }
 
+    # Handle multiple address parts: collect matches for each address separately
+    all_matched_ids = []
+    all_selected_rows = []
+    all_facility_comments = []
+    all_match_bases = []
+    
+    # If multiple addresses exist, map each one
+    if parsed_feature['multiple_addresses']:
+        for addr in parsed_feature['multiple_addresses']:
+            # Create temporary input_ctx with this address
+            temp_ctx = input_ctx.copy()
+            temp_ctx['feature_value'] = addr
+            temp_parsed = parse_feature_value(addr)
+            temp_ctx['address_hint'] = addr
+            # Score candidates for this address
+            addr_scored = []
+            for _, cand in short.iterrows():
+                sc = score_candidate(temp_ctx, cand, master_cols, facility_type_input)
+                if sc['score'] >= SCORE_THRESHOLDS["shortlist_min_score"]:
+                    addr_scored.append({'candidate': cand, **sc})
+            if addr_scored:
+                addr_scored.sort(key=lambda x: x['score'], reverse=True)
+                best = addr_scored[0]
+                if best['score'] >= SCORE_THRESHOLDS["low_confidence"]:
+                    all_matched_ids.append(str(best['candidate'][master_cols['location_id']]))
+                    all_selected_rows.append(best['candidate'])
+                    if best['facility_comment']:
+                        all_facility_comments.append(best['facility_comment'])
+                    all_match_bases.append(f'Address part: {addr[:50]} -> score {best["score"]}')
+        # Deduplicate
+        all_matched_ids = list(dict.fromkeys(all_matched_ids))
+        if all_matched_ids:
+            matched_ids = '|'.join(all_matched_ids)
+            # For score, use average? We'll use max score from any match
+            max_score = max([s['score'] for s in scored[:1]] + [0])
+            confidence = infer_confidence(max_score)
+            needs_review = 'No' if max_score >= 75 else 'Yes'
+            facility_comment = '; '.join(dict.fromkeys(all_facility_comments))
+            match_basis = 'Multiple addresses mapped; ' + '; '.join(all_match_bases[:3])
+            return {
+                'matched_ids': matched_ids,
+                'score': max_score,
+                'confidence': confidence,
+                'needs_review': needs_review,
+                'selected_rows': all_selected_rows,
+                'match_basis': match_basis,
+                'alternatives': '',
+                'facility_comment': facility_comment
+            }
+    
+    # Single address or fallback
     top = scored[0]
     top_score = top['score']
     top_breakdown = top['breakdown']
 
-    multi = [top]
-    for s in scored[1:8]:
-        same_address = address_similarity(
+    # Check if multiple master rows have the same address (or very similar) and collect them
+    same_address_rows = []
+    for s in scored:
+        if address_similarity(
             safe_str(s['candidate'].get(master_cols.get('full_address', ''), '')),
             safe_str(top['candidate'].get(master_cols.get('full_address', ''), ''))
-        ) >= 0.92
-        same_facility = max(
-            similarity(safe_str(s['candidate'].get(master_cols.get('facility_name', ''), '')),
-                       safe_str(top['candidate'].get(master_cols.get('facility_name', ''), ''))),
-            similarity(safe_str(s['candidate'].get('DisplayName', '')),
-                       safe_str(top['candidate'].get('DisplayName', '')))
-        ) >= 0.88
-        exact_facility = normalize_text(safe_str(s['candidate'].get(master_cols.get('facility_name', ''), ''))) == normalize_text(safe_str(top['candidate'].get(master_cols.get('facility_name', ''), '')))
-        s_codes = extract_code_tokens(' '.join([
-            safe_str(s['candidate'].get(master_cols.get('facility_name', ''), '')),
-            safe_str(s['candidate'].get('DisplayName', ''))
-        ]))
-        t_codes = extract_code_tokens(' '.join([
-            safe_str(top['candidate'].get(master_cols.get('facility_name', ''), '')),
-            safe_str(top['candidate'].get('DisplayName', ''))
-        ]))
-        same_codes = bool(s_codes and t_codes and s_codes == t_codes)
-        same_company = max(
-            company_similarity(safe_str(s['candidate'].get(master_cols.get('company_name', ''), '')),
-                               safe_str(top['candidate'].get(master_cols.get('company_name', ''), ''))),
-            company_similarity(safe_str(s['candidate'].get(master_cols.get('group_name', ''), '')),
-                               safe_str(top['candidate'].get(master_cols.get('group_name', ''), '')))
-        ) >= 0.9
-        if s['score'] >= 75 and abs(s['score'] - top_score) <= 3 and same_address and same_company and (exact_facility or same_codes):
-            multi.append(s)
+        ) >= 0.95:
+            same_address_rows.append(s)
+    multi = same_address_rows if len(same_address_rows) > 1 else [top]
 
+    matched_ids = '|'.join(str(s['candidate'][master_cols['location_id']]) for s in multi)
+    facility_comment = '; '.join(dict.fromkeys([s['facility_comment'] for s in multi if s['facility_comment']]))
+    
     if top_score < SCORE_THRESHOLDS["low_confidence"]:
         return {
             'matched_ids': '',
@@ -937,9 +1012,9 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
             'selected_rows': [],
             'match_basis': 'Weak evidence below threshold',
             'alternatives': format_alternatives(scored[:3], master_cols),
+            'facility_comment': facility_comment
         }
 
-    matched_ids = '|'.join(str(s['candidate'][master_cols['location_id']]) for s in multi)
     close_alternative = len(scored) > 1 and abs(scored[1]['score'] - top_score) <= 5
     conflicting = any(reason in top['reasons'] for reason in ['company mismatch with weak address support', 'country conflict', 'state conflict'])
     needs_review = 'Yes' if top_score < SCORE_THRESHOLDS["needs_review_threshold"] or len(multi) > 1 or close_alternative or conflicting else 'No'
@@ -984,6 +1059,7 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
         'selected_rows': [s['candidate'] for s in multi],
         'match_basis': '; '.join(basis_parts) if basis_parts else 'best overall weighted match',
         'alternatives': format_alternatives(scored[1:4], master_cols),
+        'facility_comment': facility_comment
     }
 
 def format_alternatives(scored_list: List[Dict], master_cols: Dict[str, str]) -> str:
@@ -999,10 +1075,9 @@ def format_alternatives(scored_list: List[Dict], master_cols: Dict[str, str]) ->
     return ' || '.join(items)
 
 # ------------------------------
-# New: Abbreviation-based direct mapping (now with fuzzy matching)
+# Abbreviation-based direct mapping (fuzzy + contains)
 # ------------------------------
 def load_abbreviation_map(abbr_path: Optional[Path]) -> Tuple[Optional[Dict], Optional[List[Tuple[str, Dict]]]]:
-    """Load abbreviation file and return (exact_map, fuzzy_list)."""
     if not abbr_path or not abbr_path.exists():
         return None, None
     try:
@@ -1010,14 +1085,13 @@ def load_abbreviation_map(abbr_path: Optional[Path]) -> Tuple[Optional[Dict], Op
             df = pd.read_csv(abbr_path)
         else:
             df = pd.read_excel(abbr_path)
-        # Normalise column names
         df.columns = [clean_header(c) for c in df.columns]
         expected = ['locationabbreviation', 'sitelevel', 'companylocationid', 'country', 'state', 'city', 'manufacturingcompany']
         for exp in expected:
             if exp not in df.columns:
                 raise ValueError(f"Abbreviation file missing required column: {exp} (normalised). Found: {list(df.columns)}")
         exact_map = {}
-        fuzzy_list = []  # list of (normalized_key, mapping_dict)
+        fuzzy_list = []
         for _, row in df.iterrows():
             key_raw = safe_str(row['locationabbreviation'])
             if not key_raw:
@@ -1041,32 +1115,21 @@ def load_abbreviation_map(abbr_path: Optional[Path]) -> Tuple[Optional[Dict], Op
         raise
 
 def find_best_abbreviation_match(feature_value: str, exact_map: Dict[str, Dict], fuzzy_list: List[Tuple[str, Dict]], threshold: int = ABBREVIATION_MATCH_THRESHOLD) -> Optional[Dict]:
-    """
-    Try to match feature_value against abbreviation keys.
-    First exact match (normalised), then fuzzy (similarity >= threshold), then contains (if one is substring of the other).
-    Returns mapping dict if found, else None.
-    """
     norm_feature = normalize_text(feature_value)
-    # 1. Exact match
     if norm_feature in exact_map:
         logger.debug(f"Exact abbreviation match: '{feature_value}' -> {exact_map[norm_feature]['CompanyLocationID']}")
         return exact_map[norm_feature]
 
-    # 2. Fuzzy matching using rapidfuzz (if available)
     if fuzzy_list and process is not None:
-        # Extract keys for fuzzy search
         keys = [k for k, _ in fuzzy_list]
-        # Use extractOne to get best match
         result = process.extractOne(norm_feature, keys, scorer=fuzz.ratio, score_cutoff=threshold)
         if result:
             best_key, score, _ = result
-            # Find mapping for that key
             for k, mapping in fuzzy_list:
                 if k == best_key:
                     logger.info(f"Fuzzy abbreviation match: '{feature_value}' -> '{mapping['original_abbreviation']}' (score={score})")
                     return mapping
 
-    # 3. Contains / substring matching
     for norm_key, mapping in fuzzy_list:
         if norm_feature in norm_key or norm_key in norm_feature:
             logger.info(f"Contains abbreviation match: '{feature_value}' contains/is contained in '{mapping['original_abbreviation']}'")
@@ -1075,14 +1138,13 @@ def find_best_abbreviation_match(feature_value: str, exact_map: Dict[str, Dict],
     return None
 
 # ------------------------------
-# Main pipeline with abbreviation support (updated)
+# Main pipeline with abbreviation and formatting
 # ------------------------------
 def map_locations(master_path: Path, input_path: Path, output_path: Path,
                   master_sheet: Optional[str] = None, input_sheet: Optional[str] = None,
                   abbreviation_path: Optional[Path] = None,
                   progress_callback=None):
     try:
-        # Load master
         master_sheet_name = 0 if master_sheet in (None, '') else master_sheet
         input_sheet_name = 0 if input_sheet in (None, '') else input_sheet
         if master_path.suffix.lower() == '.csv':
@@ -1090,13 +1152,11 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
         else:
             master_df = pd.read_excel(master_path, sheet_name=master_sheet_name)
 
-        # Load input
         if input_path.suffix.lower() == '.csv':
             input_df = pd.read_csv(input_path)
         else:
             input_df = pd.read_excel(input_path, sheet_name=input_sheet_name)
 
-        # Load abbreviation map if provided
         exact_abbr_map, fuzzy_abbr_list = load_abbreviation_map(abbreviation_path) if abbreviation_path else (None, None)
 
         logger.info(f"Loaded master: {len(master_df)} rows, input: {len(input_df)} rows")
@@ -1106,7 +1166,6 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
         logger.error(f"Failed to load files: {e}")
         raise
 
-    # Detect columns in master and input
     master_cols = detect_columns(master_df, [
         'location_id', 'company_name', 'group_name', 'facility_name', 'facility_type',
         'country_name', 'full_address', 'state_name', 'city_name'
@@ -1125,7 +1184,6 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
     if missing_input:
         raise ValueError(f'Missing required input columns: {missing_input}')
 
-    # Precompute master search tokens (needed only for fallback)
     master_df['_search_blob_norm'] = master_df.apply(lambda r: normalize_text(build_master_search_blob(r, master_cols)), axis=1)
     master_df['_search_blob_tokens'] = master_df['_search_blob_norm'].apply(informative_tokens)
     master_df['_country_norm'] = master_df[master_cols['country_name']].apply(normalize_country)
@@ -1142,13 +1200,12 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
         detected_row_id = safe_str(row.get(input_cols.get('input_row_id'))) if input_cols.get('input_row_id') else ''
         row_id = detected_row_id if detected_row_id else str(idx + 1)
 
-        # Step 1: Try abbreviation mapping (exact, fuzzy, contains)
+        # Try abbreviation match first (exact, fuzzy, contains)
         abbr_match = None
         if exact_abbr_map is not None:
             abbr_match = find_best_abbreviation_match(feature_value, exact_abbr_map, fuzzy_abbr_list)
 
         if abbr_match is not None:
-            # Direct match found – populate result directly
             result_row = dict(row)
             result_row.update({
                 'Input_Row_ID': row_id,
@@ -1175,11 +1232,12 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
                 'State': abbr_match['State'],
                 'City': abbr_match['City'],
                 'ManufacturingCompany': abbr_match['ManufacturingCompany'],
+                'Facility_Comment': ''
             })
             results.append(result_row)
-            continue  # skip master search for this row
+            continue
 
-        # Step 2: No abbreviation match – use original master matching
+        # No abbreviation match – use master matching
         cache_key = (
             feature_value,
             safe_str(row.get(input_cols.get('input_facility_type', ''), '')),
@@ -1201,6 +1259,45 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
             values = [v for v in values if v]
             return '|'.join(dict.fromkeys(values))
 
+        # If multiple matched IDs exist, we need to combine geography and facility type appropriately
+        matched_ids = decision['matched_ids']
+        if '|' in matched_ids:
+            # Multiple IDs: gather info from each selected row
+            companies = []
+            groups = []
+            facilities = []
+            facility_types = []
+            addresses = []
+            cities = []
+            states = []
+            countries = []
+            for sel in selected:
+                companies.append(safe_str(sel.get(master_cols['company_name'])))
+                groups.append(safe_str(sel.get(master_cols['group_name'])))
+                facilities.append(safe_str(sel.get(master_cols['facility_name'])))
+                facility_types.append(safe_str(sel.get(master_cols['facility_type'])))
+                addresses.append(safe_str(sel.get(master_cols['full_address'])))
+                cities.append(safe_str(sel.get(master_cols['city_name'])))
+                states.append(safe_str(sel.get(master_cols['state_name'])))
+                countries.append(safe_str(sel.get(master_cols['country_name'])))
+            matched_company = '|'.join(dict.fromkeys([c for c in companies if c]))
+            matched_group = '|'.join(dict.fromkeys([g for g in groups if g]))
+            matched_facility = '|'.join(dict.fromkeys([f for f in facilities if f]))
+            matched_facility_type = '|'.join(dict.fromkeys([ft for ft in facility_types if ft]))
+            matched_address = '|'.join(dict.fromkeys([a for a in addresses if a]))
+            matched_city = '|'.join(dict.fromkeys([c for c in cities if c]))
+            matched_state = '|'.join(dict.fromkeys([s for s in states if s]))
+            matched_country = '|'.join(dict.fromkeys([co for co in countries if co]))
+        else:
+            matched_company = get_selected('company_name')
+            matched_group = get_selected('group_name')
+            matched_facility = get_selected('facility_name')
+            matched_facility_type = get_selected('facility_type')
+            matched_address = get_selected('full_address')
+            matched_city = get_selected('city_name')
+            matched_state = get_selected('state_name')
+            matched_country = get_selected('country_name')
+
         result_row = dict(row)
         result_row.update({
             'Input_Row_ID': row_id,
@@ -1210,23 +1307,24 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
             'Matched_Location_ID': decision['matched_ids'],
             'Match_Confidence_Score': decision['score'],
             'Confidence_Level': decision['confidence'],
-            'Matched_Company_Name': get_selected('company_name'),
-            'Matched_GroupName': get_selected('group_name'),
-            'Matched_Facility_Name': get_selected('facility_name'),
-            'Matched_Facility_Type': get_selected('facility_type'),
-            'Matched_Full_Address': get_selected('full_address'),
-            'Matched_City_name': get_selected('city_name'),
-            'Matched_State_Name': get_selected('state_name'),
-            'Matched_CountryName': get_selected('country_name'),
+            'Matched_Company_Name': matched_company,
+            'Matched_GroupName': matched_group,
+            'Matched_Facility_Name': matched_facility,
+            'Matched_Facility_Type': matched_facility_type,
+            'Matched_Full_Address': matched_address,
+            'Matched_City_name': matched_city,
+            'Matched_State_Name': matched_state,
+            'Matched_CountryName': matched_country,
             'Match_Basis': decision['match_basis'],
             'Alternative_Candidates': decision['alternatives'],
             'Needs_Review': decision['needs_review'],
-            'SiteLevel': get_selected('facility_type'),
+            'SiteLevel': matched_facility_type,
             'CompanyLocationID': decision['matched_ids'],
-            'Country': get_selected('country_name'),
-            'State': get_selected('state_name'),
-            'City': get_selected('city_name'),
-            'ManufacturingCompany': get_selected('company_name') or get_selected('group_name'),
+            'Country': matched_country,
+            'State': matched_state,
+            'City': matched_city,
+            'ManufacturingCompany': matched_company or matched_group,
+            'Facility_Comment': decision.get('facility_comment', '')
         })
         results.append(result_row)
 
@@ -1235,13 +1333,13 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
     updated_mapping_cols = [
         'Input_Row_ID', 'Location Abbreviation', 'FacilityType', 'SiteLevel', 'CompanyLocationID',
         'Country', 'State', 'StateProvince', 'City', 'ManufacturingCompany',
-        'Match_Confidence_Score', 'Confidence_Level', 'Needs_Review'
+        'Match_Confidence_Score', 'Confidence_Level', 'Needs_Review', 'Facility_Comment'
     ]
     audit_cols = [
         'Input_Row_ID', 'FacilityType', 'FeatureValue', 'Matched_Location_ID', 'Match_Confidence_Score',
         'Confidence_Level', 'Matched_Company_Name', 'Matched_GroupName', 'Matched_Facility_Name',
         'Matched_Facility_Type', 'Matched_Full_Address', 'Matched_City_name', 'Matched_State_Name',
-        'Matched_CountryName', 'Match_Basis', 'Alternative_Candidates', 'Needs_Review'
+        'Matched_CountryName', 'Match_Basis', 'Alternative_Candidates', 'Needs_Review', 'Facility_Comment'
     ]
     updated_mapping_df = output_df.reindex(columns=updated_mapping_cols)
     audit_df = output_df.reindex(columns=audit_cols)
@@ -1253,15 +1351,43 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
         {'Metric': 'Needs Review rows', 'Value': int((output_df['Needs_Review'] == 'Yes').sum()), 'Unnamed: 2': '', 'Unnamed: 3': ''},
     ])
 
+    # Write Excel with conditional formatting
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         updated_mapping_df.to_excel(writer, index=False, sheet_name='Updated_Mapping')
         audit_df.to_excel(writer, index=False, sheet_name='Audit_Details')
         summary.to_excel(writer, index=False, sheet_name='Summary')
+        
+        # Apply conditional formatting to Confidence_Level column in Updated_Mapping sheet
+        workbook = writer.book
+        sheet = writer.sheets['Updated_Mapping']
+        # Find column index for Confidence_Level (case insensitive)
+        col_idx = None
+        for cell in sheet[1]:  # header row
+            if cell.value and 'confidence_level' in str(cell.value).lower():
+                col_idx = cell.column
+                break
+        if col_idx:
+            # Define fills
+            green_fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")   # light green
+            yellow_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")  # gold/yellow
+            orange_fill = PatternFill(start_color="FF8C00", end_color="FF8C00", fill_type="solid")  # dark orange
+            red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")     # red
+            for row in range(2, sheet.max_row + 1):
+                cell = sheet.cell(row, col_idx)
+                val = str(cell.value).lower() if cell.value else ''
+                if 'high' in val:
+                    cell.fill = green_fill
+                elif 'medium' in val:
+                    cell.fill = yellow_fill
+                elif 'low' in val or 'review' in val:
+                    cell.fill = orange_fill
+                elif 'no match' in val:
+                    cell.fill = red_fill
 
     logger.info(f'Wrote output: {output_path}')
 
 # ------------------------------
-# CLI and GUI (same as before, no changes needed)
+# CLI and GUI (unchanged)
 # ------------------------------
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Map input locations to master Location_IDs.')
@@ -1400,7 +1526,6 @@ if __name__ == '__main__':
 
         def _run_mapping_worker(self, master: str, input_file: str, output: str, abbr: Optional[str]):
             try:
-                # Determine total rows for progress
                 try:
                     if input_file.endswith('.csv'):
                         total = pd.read_csv(input_file).shape[0]
