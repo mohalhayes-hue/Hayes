@@ -168,12 +168,22 @@ DEFAULT_CONFIG = {
     "abbreviation_match_threshold": 85
 }
 
-# Load config from file if present
+# Load config from file if present – use deep merge so nested dicts are not wiped
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base without losing unmentioned nested keys."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
 CONFIG_PATH = Path(__file__).parent / "location_mapping_config.json"
 if CONFIG_PATH.exists():
     with open(CONFIG_PATH, "r") as f:
         user_config = json.load(f)
-        DEFAULT_CONFIG.update(user_config)
+        DEFAULT_CONFIG = _deep_merge(DEFAULT_CONFIG, user_config)
 
 MASTER_WEIGHTS = DEFAULT_CONFIG["master_weights"]
 CONFIDENCE_BUCKETS = DEFAULT_CONFIG["confidence_buckets"]
@@ -181,7 +191,8 @@ PENALTIES = DEFAULT_CONFIG["penalty_values"]
 SCORE_THRESHOLDS = DEFAULT_CONFIG["score_thresholds"]
 ADDR_SIM = DEFAULT_CONFIG["address_similarity"]
 SHORTLIST_W = DEFAULT_CONFIG["shortlist_overlap_weights"]
-FACILITY_TYPE_GROUPS = DEFAULT_CONFIG["facility_type_groups"]
+# Ensure values are always sets regardless of whether they came from code or JSON
+FACILITY_TYPE_GROUPS = {k: set(v) for k, v in DEFAULT_CONFIG["facility_type_groups"].items()}
 COMPANY_SUFFIXES = set(DEFAULT_CONFIG["company_suffixes"])
 GENERIC_TOKENS = set(DEFAULT_CONFIG["generic_tokens"])
 COUNTRY_SYNONYMS = DEFAULT_CONFIG["country_synonyms"]
@@ -252,6 +263,10 @@ def normalize_text(value) -> str:
     if pd.isna(value):
         return ''
     text = str(value)
+    return _normalize_text_str(text)
+
+@lru_cache(maxsize=8192)
+def _normalize_text_str(text: str) -> str:
     text = strip_accents(text).lower().strip()
     text = text.replace('&', ' and ')
     text = re.sub(r'[_|/]+', ' ', text)
@@ -271,6 +286,7 @@ def normalize_text(value) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+@lru_cache(maxsize=4096)
 def normalize_company(value) -> str:
     text = normalize_text(value)
     tokens = [ACRONYM_ALIASES.get(t, t) for t in text.split()]
@@ -296,8 +312,13 @@ def extract_acronyms(value: str) -> set:
 def token_set(text: str) -> set:
     return {t for t in normalize_text(text).split() if t}
 
+@lru_cache(maxsize=8192)
+def _informative_tokens_cached(text: str) -> frozenset:
+    """Cached core — returns frozenset so it is hashable and cache-safe."""
+    return frozenset(t for t in normalize_text(text).split() if t and len(t) >= 3 and t not in GENERIC_TOKENS and not t.isdigit())
+
 def informative_tokens(text: str) -> set:
-    return {t for t in token_set(text) if len(t) >= 3 and t not in GENERIC_TOKENS and not t.isdigit()}
+    return set(_informative_tokens_cached(text))
 
 def safe_str(v) -> str:
     return '' if pd.isna(v) else str(v).strip()
@@ -337,9 +358,8 @@ def extract_code_tokens(text: str) -> set:
             codes.add(token)
     return codes
 
-def similarity(a: str, b: str) -> float:
-    a = normalize_text(a)
-    b = normalize_text(b)
+@lru_cache(maxsize=4096)
+def _similarity_cached(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return max(
@@ -347,6 +367,11 @@ def similarity(a: str, b: str) -> float:
         fuzz.partial_ratio(a, b),
         fuzz.token_set_ratio(a, b),
     ) / 100.0
+
+def similarity(a: str, b: str) -> float:
+    a = normalize_text(a)
+    b = normalize_text(b)
+    return _similarity_cached(a, b)
 
 def exact_or_contains(a: str, b: str) -> float:
     a = normalize_text(a)
@@ -390,7 +415,13 @@ def address_similarity(a: str, b: str) -> float:
     numeric_b = set(re.findall(r'\b\d+(?:[-/]\d+)?\b', b1))
 
     def normalize_num_set(nums):
-        return {str(int(n.split('-')[0])) for n in nums if n.isdigit()}
+        result = set()
+        for n in nums:
+            try:
+                result.add(str(int(n.split('-')[0].split('/')[0])))
+            except (ValueError, IndexError):
+                pass
+        return result
     norm_a = normalize_num_set(numeric_a)
     norm_b = normalize_num_set(numeric_b)
     if (norm_a and not norm_b) or (norm_b and not norm_a):
@@ -536,6 +567,7 @@ def _extract_entity_prefix(part: str) -> str:
         return prefix
     return ''
 
+@lru_cache(maxsize=4096)
 def parse_feature_value(feature_value: str) -> Dict[str, object]:
     raw = safe_str(feature_value)
     raw = re.sub(r'(?<=[A-Za-z])(?=\d{1,4}(?:\b|[, -]))', ' ', raw)
@@ -885,22 +917,34 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
     # Company-first shortlisting: if we have company hints, boost company-related tokens
     has_company = len(parsed_feature['company_hints']) > 0 or len(parsed_feature['potential_companies']) > 0
 
+    # Precompute token sets for master columns — avoids recomputing inside apply() per row
+    fc_col = master_cols.get('facility_name', '')
+    co_col = master_cols.get('company_name', '')
+    gr_col = master_cols.get('group_name', '')
+    ad_col = master_cols.get('full_address', '')
+    if '_itok_facility' not in master.columns:
+        master = master.copy()
+        master['_itok_facility'] = master[fc_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if fc_col else [frozenset()] * len(master)
+        master['_itok_company'] = master[co_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if co_col else [frozenset()] * len(master)
+        master['_itok_group']   = master[gr_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if gr_col else [frozenset()] * len(master)
+
     def shortlist_score(row):
         blob_tokens = row['_search_blob_tokens']
-        facility_name = safe_str(row.get(master_cols.get('facility_name', ''), ''))
-        company_name = safe_str(row.get(master_cols.get('company_name', ''), ''))
-        group_name = safe_str(row.get(master_cols.get('group_name', ''), ''))
-        address = safe_str(row.get(master_cols.get('full_address', ''), ''))
+        facility_name = safe_str(row.get(fc_col, '')) if fc_col else ''
+        company_name  = safe_str(row.get(co_col, '')) if co_col else ''
+        group_name    = safe_str(row.get(gr_col, '')) if gr_col else ''
+        address       = safe_str(row.get(ad_col, '')) if ad_col else ''
+        itok_facility = row['_itok_facility']
+        itok_company  = row['_itok_company']
+        itok_group    = row['_itok_group']
         score = 0.0
-        # Always include token overlaps
         score += len(feature_tokens & blob_tokens) * SHORTLIST_W["feature_token"]
         score += len(address_tokens & blob_tokens) * SHORTLIST_W["address_token"]
-        score += len(facility_tokens & informative_tokens(facility_name)) * SHORTLIST_W["facility_token"]
-        score += len(manufacturer_tokens & (informative_tokens(company_name) | informative_tokens(group_name))) * SHORTLIST_W["manufacturer_token"]
-        score += len(supplier_tokens & informative_tokens(group_name)) * SHORTLIST_W["supplier_token"]
-        # Company hint tokens get higher weight if company is present
+        score += len(facility_tokens & itok_facility) * SHORTLIST_W["facility_token"]
+        score += len(manufacturer_tokens & (itok_company | itok_group)) * SHORTLIST_W["manufacturer_token"]
+        score += len(supplier_tokens & itok_group) * SHORTLIST_W["supplier_token"]
         company_weight = SHORTLIST_W["company_hint_token"] * (1.5 if has_company else 1.0)
-        score += len(company_hint_tokens & (informative_tokens(company_name) | informative_tokens(group_name) | informative_tokens(facility_name))) * company_weight
+        score += len(company_hint_tokens & (itok_company | itok_group | itok_facility)) * company_weight
         
         if entity_hint and max(company_similarity(entity_hint, company_name), company_similarity(entity_hint, group_name), similarity(entity_hint, facility_name)) >= 0.85:
             score += SHORTLIST_W["entity_match_bonus"]
@@ -917,7 +961,6 @@ def choose_candidates(input_row: pd.Series, master_df: pd.DataFrame, input_cols:
             score += SHORTLIST_W["code_match_bonus"]
         return score
 
-    master = master.copy()
     master['_shortlist_overlap'] = master.apply(shortlist_score, axis=1)
     short = master.sort_values(['_shortlist_overlap'], ascending=False).head(150).copy()
 
@@ -1188,17 +1231,26 @@ def map_locations(master_path: Path, input_path: Path, output_path: Path,
     master_df['_search_blob_tokens'] = master_df['_search_blob_norm'].apply(informative_tokens)
     master_df['_country_norm'] = master_df[master_cols['country_name']].apply(normalize_country)
 
+    # Precompute informative token sets for the three most-used master columns once,
+    # so choose_candidates never recomputes them per input row.
+    fc_col = master_cols.get('facility_name', '')
+    co_col = master_cols.get('company_name', '')
+    gr_col = master_cols.get('group_name', '')
+    master_df['_itok_facility'] = master_df[fc_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if fc_col else [frozenset()] * len(master_df)
+    master_df['_itok_company']  = master_df[co_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if co_col else [frozenset()] * len(master_df)
+    master_df['_itok_group']    = master_df[gr_col].apply(lambda v: _informative_tokens_cached(safe_str(v))) if gr_col else [frozenset()] * len(master_df)
+
     results = []
     decision_cache = {}
     total_rows = len(input_df)
 
-    for idx, row in input_df.iterrows():
+    for row_num, (idx, row) in enumerate(input_df.iterrows(), start=1):
         if progress_callback:
-            progress_callback(idx + 1, total_rows)
+            progress_callback(row_num, total_rows)
 
         feature_value = safe_str(row.get(input_cols.get('feature_value', ''), ''))
         detected_row_id = safe_str(row.get(input_cols.get('input_row_id'))) if input_cols.get('input_row_id') else ''
-        row_id = detected_row_id if detected_row_id else str(idx + 1)
+        row_id = detected_row_id if detected_row_id else str(row_num)
 
         # Try abbreviation match first (exact, fuzzy, contains)
         abbr_match = None
